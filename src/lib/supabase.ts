@@ -11,21 +11,6 @@ export const supabase = isConfigured
   : null as any;
 
 /**
- * Helper to fetch Supabase config from the server if not provided via environment variables.
- * This is useful when using platform "Secrets" which are not prefixed with VITE_.
- */
-export async function getSupabaseConfigFromServer() {
-  try {
-    const response = await fetch('/api/supabase-config');
-    if (!response.ok) return null;
-    return await response.json();
-  } catch (e) {
-    console.error('Failed to fetch Supabase config from server:', e);
-    return null;
-  }
-}
-
-/**
  * Re-initialize the Supabase client with new config
  */
 export function initSupabase(url: string, key: string) {

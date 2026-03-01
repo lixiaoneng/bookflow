@@ -56,7 +56,7 @@ import {
 } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
 import { cn, BOOK_STAGES, ProjectStatus, type Project, type Editor, type Stage, type StageName, type Group } from './types';
-import { supabase as initialSupabase, isConfigured as initialIsConfigured, getSupabaseConfigFromServer, initSupabase } from './lib/supabase';
+import { supabase as initialSupabase, isConfigured as initialIsConfigured } from './lib/supabase';
 import { Cloud, CloudOff, RefreshCw } from 'lucide-react';
 
 // --- Constants ---
@@ -103,35 +103,17 @@ export default function App() {
   const [syncError, setSyncError] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
-  const [supabaseClient, setSupabaseClient] = useState(initialSupabase);
-  const [isSupabaseConfigured, setIsSupabaseConfigured] = useState(initialIsConfigured);
+  const [supabaseClient] = useState(initialSupabase);
+  const [isSupabaseConfigured] = useState(initialIsConfigured);
+  const [configError, setConfigError] = useState<string | null>(null);
 
   useEffect(() => {
-    const setupSupabase = async () => {
-      if (!isSupabaseConfigured) {
-        console.log('Fetching Supabase config from server...');
-        const config = await getSupabaseConfigFromServer();
-        console.log('Received Supabase config:', { 
-          hasUrl: !!config?.supabaseUrl, 
-          hasKey: !!config?.supabaseAnonKey 
-        });
-        
-        if (config && config.supabaseUrl && config.supabaseAnonKey) {
-          const client = initSupabase(config.supabaseUrl, config.supabaseAnonKey);
-          if (client) {
-            console.log('Supabase client initialized successfully');
-            setSupabaseClient(client);
-            setIsSupabaseConfigured(true);
-          } else {
-            console.error('Failed to initialize Supabase client');
-          }
-        } else {
-          console.error('Missing Supabase URL or Anon Key in server config');
-        }
-      }
-    };
-    setupSupabase();
-  }, []);
+    if (!isSupabaseConfigured) {
+      setConfigError('未检测到 Supabase 环境变量。请在 Vercel 设置中添加 VITE_SUPABASE_URL 和 VITE_SUPABASE_ANON_KEY。');
+    } else {
+      setConfigError(null);
+    }
+  }, [isSupabaseConfigured]);
 
   const fetchFromCloud = async () => {
     if (!isSupabaseConfigured || !supabaseClient) return;
@@ -529,6 +511,22 @@ export default function App() {
           </div>
         </header>
 
+        {configError && (
+          <div className="bg-amber-50 border-l-4 border-amber-500 p-4 m-4 lg:m-8 mb-0 rounded-r-md shadow-sm">
+            <div className="flex">
+              <div className="flex-shrink-0">
+                <AlertTriangle className="h-5 w-5 text-amber-500" aria-hidden="true" />
+              </div>
+              <div className="ml-3">
+                <h3 className="text-sm font-medium text-amber-800">配置警告</h3>
+                <div className="mt-2 text-sm text-amber-700">
+                  <p>{configError}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="p-4 lg:p-8">
           {selectedProjectId && selectedProject ? (
             <ProjectDetailView 
@@ -672,19 +670,25 @@ function DashboardView({ projects, editors, onSelectProject, onNavigateToProject
 }
 
 function ProjectRiskOverview({ projects, onSelectProject }: { projects: Project[], onSelectProject: (id: string) => void }) {
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(true); // Default to expanded for visibility
+  
+  const riskProjects = useMemo(() => {
+    return projects.filter(p => p.riskIssues && p.riskIssues.trim() !== '');
+  }, [projects]);
+
+  if (riskProjects.length === 0) return null;
 
   return (
-    <div className="glass-card overflow-hidden">
+    <div className="glass-card overflow-hidden border-l-4 border-rose-500">
       <button 
         onClick={() => setIsExpanded(!isExpanded)}
         className="w-full p-6 flex items-center justify-between hover:bg-slate-50/50 transition-colors"
       >
         <div className="flex items-center gap-2">
-          <AlertCircle size={20} className="text-indigo-600" />
-          <h3 className="font-bold text-slate-800">项目当前环节与风险概览</h3>
+          <AlertTriangle size={20} className="text-rose-600" />
+          <h3 className="font-bold text-slate-800">风险概览</h3>
           <span className="text-xs font-medium text-slate-400 ml-2">
-            共 {projects.length} 个项目
+            共 {riskProjects.length} 个风险项目
           </span>
         </div>
         {isExpanded ? <ChevronUp size={20} className="text-slate-400" /> : <ChevronDown size={20} className="text-slate-400" />}
@@ -710,14 +714,14 @@ function ProjectRiskOverview({ projects, onSelectProject }: { projects: Project[
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-50">
-                      {projects.map(project => {
+                      {riskProjects.map(project => {
                         const currentStage = [...project.stages].find(s => s.status === '进行中')?.name || '已入库';
                         return (
                           <tr 
                             key={project.id} 
                             className={cn(
                               "group hover:bg-slate-50 transition-colors cursor-pointer",
-                              project.riskIssues && "bg-rose-50/50"
+                              "bg-rose-50/30"
                             )}
                             onClick={() => onSelectProject(project.id)}
                           >
@@ -1555,7 +1559,9 @@ function ProjectModal({ isOpen, onClose, onSave, editors, onAddEditor, initialDa
     if (!initialData) {
       const newStages = [...(formData.stages || [])];
       for (let i = 0; i < newStages.length; i++) {
-        newStages[i].status = i <= index ? '已完成' : '进行中';
+        // i < index means stages BEFORE the selected one are completed
+        // The selected stage (i === index) remains '进行中' (ongoing)
+        newStages[i].status = i < index ? '已完成' : '进行中';
       }
       setFormData({ ...formData, stages: newStages });
     }
