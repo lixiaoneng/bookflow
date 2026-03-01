@@ -101,6 +101,7 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSync, setLastSync] = useState<Date | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   const [supabaseClient, setSupabaseClient] = useState(initialSupabase);
   const [isSupabaseConfigured, setIsSupabaseConfigured] = useState(initialIsConfigured);
@@ -108,13 +109,24 @@ export default function App() {
   useEffect(() => {
     const setupSupabase = async () => {
       if (!isSupabaseConfigured) {
+        console.log('Fetching Supabase config from server...');
         const config = await getSupabaseConfigFromServer();
+        console.log('Received Supabase config:', { 
+          hasUrl: !!config?.supabaseUrl, 
+          hasKey: !!config?.supabaseAnonKey 
+        });
+        
         if (config && config.supabaseUrl && config.supabaseAnonKey) {
           const client = initSupabase(config.supabaseUrl, config.supabaseAnonKey);
           if (client) {
+            console.log('Supabase client initialized successfully');
             setSupabaseClient(client);
             setIsSupabaseConfigured(true);
+          } else {
+            console.error('Failed to initialize Supabase client');
           }
+        } else {
+          console.error('Missing Supabase URL or Anon Key in server config');
         }
       }
     };
@@ -126,11 +138,30 @@ export default function App() {
     setIsSyncing(true);
     setSyncError(null);
     try {
-      const { data: editorsData, error: editorsError } = await supabaseClient.from('editors').select('*');
-      if (editorsError) throw editorsError;
+      console.log('Fetching data from Supabase...');
       
+      // 1. Fetch Editors
+      const { data: editorsData, error: editorsError } = await supabaseClient.from('editors').select('*');
+      if (editorsError) {
+        console.error('Error fetching editors:', editorsError);
+        throw editorsError;
+      }
+      
+      // 2. Fetch Projects
       const { data: projectsData, error: projectsError } = await supabaseClient.from('projects').select('*');
-      if (projectsError) throw projectsError;
+      if (projectsError) {
+        console.error('Error fetching projects:', projectsError);
+        throw projectsError;
+      }
+
+      // 3. Fetch Process Nodes
+      const { data: nodesData, error: nodesError } = await supabaseClient.from('process_nodes').select('*');
+      if (nodesError) {
+        console.error('Error fetching process nodes:', nodesError);
+        throw nodesError;
+      }
+
+      console.log(`Fetched: ${editorsData?.length} editors, ${projectsData?.length} projects, ${nodesData?.length} nodes`);
 
       if (editorsData && editorsData.length > 0) {
         setEditors(editorsData.map(e => ({
@@ -141,15 +172,35 @@ export default function App() {
       }
 
       if (projectsData) {
-        setProjects(projectsData.map(p => ({
-          id: p.id,
-          name: p.name,
-          group: p.group as Group,
-          editorIds: p.editor_ids || [],
-          riskIssues: p.risk_issues || '',
-          stages: p.stages || [],
-          createdAt: p.created_at
-        })));
+        const mappedProjects: Project[] = projectsData.map(p => {
+          // Find nodes for this project
+          const pNodes = nodesData?.filter(n => n.project_id === p.id) || [];
+          // Sort by order
+          pNodes.sort((a, b) => a.order_index - b.order_index);
+          
+          // Map nodes to stages
+          let stages: Stage[] = pNodes.map(n => ({
+            name: n.node_name as StageName,
+            plannedDate: n.planned_date || '',
+            status: n.is_completed ? '已完成' : '进行中'
+          }));
+
+          // Fallback if no nodes found (e.g. new project or sync error)
+          if (stages.length === 0) {
+             stages = BOOK_STAGES.map(name => ({ name, plannedDate: '', status: '进行中' }));
+          }
+
+          return {
+            id: p.id,
+            name: p.title, // Map title -> name
+            group: (p.group_type) as Group,
+            editorIds: p.owner_ids || [], // Map owner_ids -> editorIds
+            riskIssues: p.risk_notes || '', // Map risk_notes -> riskIssues
+            stages: stages,
+            createdAt: p.created_at
+          };
+        });
+        setProjects(mappedProjects);
       }
       setLastSync(new Date());
     } catch (e: any) {
@@ -179,18 +230,50 @@ export default function App() {
     // Sync to Supabase
     if (isSupabaseConfigured && supabaseClient && projects.length > 0) {
       const syncProjects = async () => {
-        const payload = projects.map(p => ({
-          id: p.id,
-          name: p.name,
-          group: p.group,
-          editor_ids: p.editorIds,
-          risk_issues: p.riskIssues,
-          stages: p.stages,
-          created_at: p.createdAt
-        }));
-        const { error } = await supabaseClient.from('projects').upsert(payload);
-        if (error) console.error('Supabase project sync error:', error);
+        console.log('Syncing projects and nodes...');
+        
+        // 1. Prepare Projects Payload
+        const projectsPayload = projects.map(p => {
+          const storageStage = p.stages.find(s => s.name === '入库');
+          return {
+            id: p.id,
+            title: p.name, // Map name -> title
+            group_type: p.group,
+            owner_ids: p.editorIds, // Map editorIds -> owner_ids
+            risk_notes: p.riskIssues, // Map riskIssues -> risk_notes
+            target_storage_date: storageStage ? storageStage.plannedDate || null : null,
+            created_at: p.createdAt
+          };
+        });
+
+        // 2. Prepare Process Nodes Payload
+        const nodesPayload = projects.flatMap(p => 
+          p.stages.map((s, index) => ({
+            id: `${p.id}_${index}`, // Deterministic ID: projectID_index
+            project_id: p.id,
+            node_name: s.name,
+            order_index: index,
+            planned_date: s.plannedDate || null,
+            is_completed: s.status === '已完成'
+          }))
+        );
+
+        // 3. Upsert Projects
+        const { error: projError } = await supabaseClient.from('projects').upsert(projectsPayload);
+        if (projError) {
+          console.error('Sync Projects Error:', projError);
+          return; // Stop if projects fail
+        }
+
+        // 4. Upsert Nodes
+        const { error: nodeError } = await supabaseClient.from('process_nodes').upsert(nodesPayload);
+        if (nodeError) {
+          console.error('Sync Nodes Error:', nodeError);
+        } else {
+          console.log('Sync Complete: Projects & Nodes');
+        }
       };
+      
       syncProjects();
     }
   }, [projects, isSupabaseConfigured, supabaseClient]);
@@ -201,8 +284,25 @@ export default function App() {
     // Sync to Supabase
     if (isSupabaseConfigured && supabaseClient && editors.length > 0) {
       const syncEditors = async () => {
-        const { error } = await supabaseClient.from('editors').upsert(editors);
-        if (error) console.error('Supabase editor sync error:', error);
+        console.log('Syncing editors to Supabase...');
+        const payload = editors.map(e => ({
+          id: e.id,
+          name: e.name,
+          group: e.group // Maps to "group" column
+        }));
+        
+        const { error } = await supabaseClient.from('editors').upsert(payload);
+        
+        if (error) {
+          console.error('Supabase editor sync error:', {
+            code: error.code,
+            message: error.message,
+            details: error.details,
+            hint: error.hint
+          });
+        } else {
+          console.log('Editors synced successfully');
+        }
       };
       syncEditors();
     }
@@ -309,9 +409,25 @@ export default function App() {
   const selectedProject = projects.find(p => p.id === selectedProjectId);
 
   return (
-    <div className="flex h-screen bg-[#F8FAFC]">
+    <div className="flex h-screen bg-[#F8FAFC] overflow-hidden">
+      {/* Mobile Sidebar Overlay */}
+      <AnimatePresence>
+        {isSidebarOpen && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setIsSidebarOpen(false)}
+            className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-40 lg:hidden"
+          />
+        )}
+      </AnimatePresence>
+
       {/* Sidebar */}
-      <aside className="w-64 bg-white border-r border-slate-200 flex flex-col">
+      <aside className={cn(
+        "fixed inset-y-0 left-0 z-50 w-64 bg-white border-r border-slate-200 flex flex-col transition-transform duration-300 transform lg:relative lg:translate-x-0",
+        isSidebarOpen ? "translate-x-0" : "-translate-x-full"
+      )}>
         <div className="p-6">
           <div className="flex items-center gap-3 text-indigo-600 mb-8">
             <div className="bg-indigo-600 p-2 rounded-xl text-white">
@@ -359,7 +475,7 @@ export default function App() {
               icon={<LayoutDashboard size={20} />} 
               label="总览看板" 
               active={activeTab === 'dashboard'} 
-              onClick={() => { setActiveTab('dashboard'); setSelectedProjectId(null); }} 
+              onClick={() => { setActiveTab('dashboard'); setSelectedProjectId(null); setIsSidebarOpen(false); }} 
             />
             <NavItem 
               icon={<BookOpen size={20} />} 
@@ -369,20 +485,21 @@ export default function App() {
                 setActiveTab('projects'); 
                 setSelectedProjectId(null); 
                 setProjectFilters({ status: 'all', editorId: 'all' });
+                setIsSidebarOpen(false);
               }} 
             />
             <NavItem 
               icon={<Users size={20} />} 
               label="编辑管理" 
               active={activeTab === 'editors'} 
-              onClick={() => { setActiveTab('editors'); setSelectedProjectId(null); }} 
+              onClick={() => { setActiveTab('editors'); setSelectedProjectId(null); setIsSidebarOpen(false); }} 
             />
           </nav>
         </div>
         
         <div className="mt-auto p-6 border-t border-slate-100">
           <button 
-            onClick={() => { setEditingProject(null); setIsProjectModalOpen(true); }}
+            onClick={() => { setEditingProject(null); setIsProjectModalOpen(true); setIsSidebarOpen(false); }}
             className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white py-2.5 rounded-xl font-medium transition-all shadow-sm shadow-indigo-200"
           >
             <Plus size={18} />
@@ -392,19 +509,27 @@ export default function App() {
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 overflow-y-auto">
-        <header className="h-16 bg-white/80 backdrop-blur-md border-bottom border-slate-200 sticky top-0 z-10 flex items-center justify-between px-8">
-          <h2 className="text-lg font-semibold text-slate-800">
-            {selectedProjectId ? '项目详情' : activeTab === 'dashboard' ? '数据看板' : activeTab === 'projects' ? '所有项目' : '编辑人员'}
-          </h2>
+      <main className="flex-1 overflow-y-auto relative">
+        <header className="h-16 bg-white/80 backdrop-blur-md border-b border-slate-200 sticky top-0 z-30 flex items-center justify-between px-4 lg:px-8">
           <div className="flex items-center gap-4">
-            <div className="text-sm text-slate-500 font-medium">
+            <button 
+              onClick={() => setIsSidebarOpen(true)}
+              className="p-2 hover:bg-slate-100 rounded-lg lg:hidden text-slate-600"
+            >
+              <LayoutDashboard size={24} />
+            </button>
+            <h2 className="text-lg font-semibold text-slate-800">
+              {selectedProjectId ? '项目详情' : activeTab === 'dashboard' ? '数据看板' : activeTab === 'projects' ? '所有项目' : '编辑人员'}
+            </h2>
+          </div>
+          <div className="flex items-center gap-4">
+            <div className="text-sm text-slate-500 font-medium hidden sm:block">
               {format(new Date(), 'yyyy年MM月dd日')}
             </div>
           </div>
         </header>
 
-        <div className="p-8">
+        <div className="p-4 lg:p-8">
           {selectedProjectId && selectedProject ? (
             <ProjectDetailView 
               project={selectedProject} 
@@ -503,7 +628,7 @@ function DashboardView({ projects, editors, onSelectProject, onNavigateToProject
   return (
     <div className="space-y-8">
       {/* Stat Cards */}
-      <div className="grid grid-cols-4 gap-6">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 lg:gap-6">
         <StatCard 
           label="项目总数" 
           value={stats.total} 
@@ -573,55 +698,59 @@ function ProjectRiskOverview({ projects, onSelectProject }: { projects: Project[
             exit={{ height: 0, opacity: 0 }}
             className="border-t border-slate-100"
           >
-            <div className="p-6 pt-0 max-h-[400px] overflow-y-auto">
-              <table className="w-full text-left">
-                <thead className="sticky top-0 bg-white py-3 text-xs font-bold text-slate-400 uppercase tracking-wider border-b border-slate-100">
-                  <tr>
-                    <th className="py-3 pr-4">项目名称</th>
-                    <th className="py-3 pr-4">当前环节</th>
-                    <th className="py-3">风险与问题</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-50">
-                  {projects.map(project => {
-                    const currentStage = [...project.stages].find(s => s.status === '进行中')?.name || '已入库';
-                    return (
-                      <tr 
-                        key={project.id} 
-                        className={cn(
-                          "group hover:bg-slate-50 transition-colors cursor-pointer",
-                          project.riskIssues && "bg-rose-50/50"
-                        )}
-                        onClick={() => onSelectProject(project.id)}
-                      >
-                        <td className="py-4 pr-4">
-                          <div className="font-bold text-slate-800 group-hover:text-indigo-600 transition-colors truncate max-w-[200px]">
-                            {project.name}
-                          </div>
-                        </td>
-                        <td className="py-4 pr-4">
-                          <span className={cn(
-                            "px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider",
-                            currentStage === '已入库' ? "bg-emerald-100 text-emerald-700" : "bg-indigo-100 text-indigo-700"
-                          )}>
-                            {currentStage}
-                          </span>
-                        </td>
-                        <td className="py-4">
-                          {project.riskIssues ? (
-                            <div className="flex items-start gap-2 text-rose-600 text-sm">
-                              <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" />
-                              <span className="line-clamp-2">{project.riskIssues}</span>
-                            </div>
-                          ) : (
-                            <span className="text-slate-400 text-xs italic">暂无风险</span>
-                          )}
-                        </td>
+            <div className="p-4 lg:p-6 pt-0 max-h-[400px] overflow-y-auto">
+              <div className="overflow-x-auto -mx-4 lg:mx-0">
+                <div className="inline-block min-w-full align-middle px-4 lg:px-0">
+                  <table className="min-w-full text-left">
+                    <thead className="sticky top-0 bg-white py-3 text-xs font-bold text-slate-400 uppercase tracking-wider border-b border-slate-100">
+                      <tr>
+                        <th className="py-3 pr-4">项目名称</th>
+                        <th className="py-3 pr-4">当前环节</th>
+                        <th className="py-3">风险与问题</th>
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                    </thead>
+                    <tbody className="divide-y divide-slate-50">
+                      {projects.map(project => {
+                        const currentStage = [...project.stages].find(s => s.status === '进行中')?.name || '已入库';
+                        return (
+                          <tr 
+                            key={project.id} 
+                            className={cn(
+                              "group hover:bg-slate-50 transition-colors cursor-pointer",
+                              project.riskIssues && "bg-rose-50/50"
+                            )}
+                            onClick={() => onSelectProject(project.id)}
+                          >
+                            <td className="py-4 pr-4">
+                              <div className="font-bold text-slate-800 group-hover:text-indigo-600 transition-colors truncate max-w-[120px] sm:max-w-[200px]">
+                                {project.name}
+                              </div>
+                            </td>
+                            <td className="py-4 pr-4">
+                              <span className={cn(
+                                "px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider whitespace-nowrap",
+                                currentStage === '已入库' ? "bg-emerald-100 text-emerald-700" : "bg-indigo-100 text-indigo-700"
+                              )}>
+                                {currentStage}
+                              </span>
+                            </td>
+                            <td className="py-4">
+                              {project.riskIssues ? (
+                                <div className="flex items-start gap-2 text-rose-600 text-sm min-w-[150px]">
+                                  <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" />
+                                  <span className="line-clamp-2">{project.riskIssues}</span>
+                                </div>
+                              ) : (
+                                <span className="text-slate-400 text-xs italic">暂无风险</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
             </div>
           </motion.div>
         )}
@@ -658,7 +787,7 @@ function GroupBoard({ projects }: { projects: Project[] }) {
         <BarChart3 size={20} className="text-indigo-600" />
         组别看板
       </h3>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-x-12 gap-y-8">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-12 gap-y-8">
         {groupData.map(group => (
           <div key={group.name} className="space-y-3">
             <div className="flex justify-between items-end">
@@ -691,7 +820,7 @@ function GroupBoard({ projects }: { projects: Project[] }) {
           </div>
         ))}
       </div>
-      <div className="mt-8 pt-6 border-t border-slate-50 flex items-center gap-8 text-xs font-medium text-slate-500">
+      <div className="mt-8 pt-6 border-t border-slate-50 flex flex-wrap items-center gap-x-8 gap-y-4 text-xs font-medium text-slate-500">
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 rounded bg-blue-500"></div>
           <span>待入库未逾期</span>
@@ -752,14 +881,14 @@ function CalendarBoard({ projects, onSelectProject }: { projects: Project[], onS
   const weekDays = ['日', '一', '二', '三', '四', '五', '六'];
 
   return (
-    <div className="glass-card p-6">
-      <div className="flex items-center justify-between mb-6">
+    <div className="glass-card p-4 lg:p-6">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
         <h3 className="font-bold text-slate-800 flex items-center gap-2">
           <Calendar size={20} className="text-indigo-600" />
           入库计划月历
         </h3>
-        <div className="flex items-center gap-4">
-          <div className="text-lg font-bold text-slate-700">
+        <div className="flex items-center justify-between sm:justify-end gap-4">
+          <div className="text-base lg:text-lg font-bold text-slate-700">
             {format(currentMonth, 'yyyy年 M月', { locale: zhCN })}
           </div>
           <div className="flex items-center gap-1">
@@ -776,54 +905,58 @@ function CalendarBoard({ projects, onSelectProject }: { projects: Project[], onS
         </div>
       </div>
 
-      <div className="grid grid-cols-7 gap-px bg-slate-100 border border-slate-100 rounded-xl overflow-hidden">
-        {weekDays.map(day => (
-          <div key={day} className="bg-slate-50 py-3 text-center text-xs font-bold text-slate-400 uppercase tracking-wider">
-            {day}
-          </div>
-        ))}
-        {calendarDays.map((day, i) => {
-          const dayProjects = getDayProjects(day);
-          const isCurrentMonth = isSameMonth(day, monthStart);
-          const isTodayDate = isToday(day);
+      <div className="overflow-x-auto -mx-4 lg:mx-0 px-4 lg:px-0">
+        <div className="min-w-[700px]">
+          <div className="grid grid-cols-7 gap-px bg-slate-100 border border-slate-100 rounded-xl overflow-hidden">
+            {weekDays.map(day => (
+              <div key={day} className="bg-slate-50 py-3 text-center text-xs font-bold text-slate-400 uppercase tracking-wider">
+                {day}
+              </div>
+            ))}
+            {calendarDays.map((day, i) => {
+              const dayProjects = getDayProjects(day);
+              const isCurrentMonth = isSameMonth(day, monthStart);
+              const isTodayDate = isToday(day);
 
-          return (
-            <div 
-              key={i} 
-              className={cn(
-                "min-h-[100px] bg-white p-2 transition-colors hover:bg-slate-50/50",
-                !isCurrentMonth && "bg-slate-50/30 text-slate-300"
-              )}
-            >
-              <div className="flex justify-between items-start mb-1">
-                <span className={cn(
-                  "text-sm font-medium w-6 h-6 flex items-center justify-center rounded-full",
-                  isTodayDate ? "bg-indigo-600 text-white" : isCurrentMonth ? "text-slate-700" : "text-slate-300"
-                )}>
-                  {format(day, 'd')}
-                </span>
-              </div>
-              <div className="space-y-1">
-                {dayProjects.map(project => (
-                  <button
-                    key={project.id}
-                    onClick={() => onSelectProject(project.id)}
-                    className={cn(
-                      "w-full text-left px-2 py-1 rounded text-[10px] font-medium text-white truncate transition-transform hover:scale-[1.02] active:scale-[0.98]",
-                      getProjectStatusColor(project)
-                    )}
-                    title={project.name}
-                  >
-                    {project.name}
-                  </button>
-                ))}
-              </div>
-            </div>
-          );
-        })}
+              return (
+                <div 
+                  key={i} 
+                  className={cn(
+                    "min-h-[100px] bg-white p-2 transition-colors hover:bg-slate-50/50",
+                    !isCurrentMonth && "bg-slate-50/30 text-slate-300"
+                  )}
+                >
+                  <div className="flex justify-between items-start mb-1">
+                    <span className={cn(
+                      "text-sm font-medium w-6 h-6 flex items-center justify-center rounded-full",
+                      isTodayDate ? "bg-indigo-600 text-white" : isCurrentMonth ? "text-slate-700" : "text-slate-300"
+                    )}>
+                      {format(day, 'd')}
+                    </span>
+                  </div>
+                  <div className="space-y-1">
+                    {dayProjects.map(project => (
+                      <button
+                        key={project.id}
+                        onClick={() => onSelectProject(project.id)}
+                        className={cn(
+                          "w-full text-left px-2 py-1 rounded text-[10px] font-medium text-white truncate transition-transform hover:scale-[1.02] active:scale-[0.98]",
+                          getProjectStatusColor(project)
+                        )}
+                        title={project.name}
+                      >
+                        {project.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
       </div>
 
-      <div className="mt-6 flex items-center gap-6 text-xs font-medium text-slate-500">
+      <div className="mt-6 flex flex-wrap items-center gap-x-6 gap-y-2 text-xs font-medium text-slate-500">
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 rounded bg-blue-500"></div>
           <span>计划入库</span>
@@ -922,20 +1055,20 @@ function ProjectListView({ projects, editors, onSelectProject, onDeleteProject, 
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between gap-4">
-        <div className="relative flex-1 max-w-md">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="relative w-full sm:max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
           <input 
             type="text" 
             placeholder="搜索项目名称..." 
-            className="w-full pl-10 pr-4 py-2.5 bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
+            className="w-full pl-10 pr-4 py-2.5 bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all text-sm sm:text-base"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
         </div>
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <select 
-            className="bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+            className="flex-1 sm:flex-none bg-white border border-slate-200 rounded-xl px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
             value={filterGroup}
             onChange={(e) => setFilterGroup(e.target.value)}
           >
@@ -943,7 +1076,7 @@ function ProjectListView({ projects, editors, onSelectProject, onDeleteProject, 
             {GROUPS.map(g => <option key={g} value={g}>{g}</option>)}
           </select>
           <select 
-            className="bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+            className="flex-1 sm:flex-none bg-white border border-slate-200 rounded-xl px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
             value={filterEditor}
             onChange={(e) => setFilterEditor(e.target.value)}
           >
@@ -951,7 +1084,7 @@ function ProjectListView({ projects, editors, onSelectProject, onDeleteProject, 
             {editors.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
           </select>
           <select 
-            className="bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+            className="flex-1 sm:flex-none bg-white border border-slate-200 rounded-xl px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
             value={filterStatus}
             onChange={(e) => setFilterStatus(e.target.value)}
           >
@@ -961,7 +1094,7 @@ function ProjectListView({ projects, editors, onSelectProject, onDeleteProject, 
             <option value="overdue">已逾期</option>
           </select>
           <select 
-            className="bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+            className="w-full sm:w-auto bg-white border border-slate-200 rounded-xl px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
             value={sortBy}
             onChange={(e) => setSortBy(e.target.value as any)}
           >
@@ -1016,60 +1149,62 @@ function ProjectCard({ project, editors, onClick, onDelete, onEdit }: {
   return (
     <div 
       className={cn(
-        "glass-card p-6 flex items-center gap-6 group cursor-pointer hover:border-indigo-300 transition-all",
+        "glass-card p-4 sm:p-6 flex flex-col sm:flex-row sm:items-center gap-4 sm:gap-6 group cursor-pointer hover:border-indigo-300 transition-all relative",
         isOverdue && "border-rose-200 bg-rose-50/30",
         project.riskIssues && "border-rose-400 bg-rose-50 ring-1 ring-rose-200"
       )}
       onClick={onClick}
     >
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-3 mb-2">
-          <h4 className="font-bold text-slate-900 truncate text-lg">{project.name}</h4>
-          <span className={cn(
-            "status-pill",
-            project.group === '绘本组' ? "bg-blue-100 text-blue-700" :
-            project.group === '科普组' ? "bg-purple-100 text-purple-700" :
-            project.group === '文学组' ? "bg-emerald-100 text-emerald-700" :
-            "bg-slate-100 text-slate-700"
-          )}>
-            {project.group}
-          </span>
-          {isOverdue && (
-            <span className="status-pill bg-rose-100 text-rose-700 flex items-center gap-1">
-              <AlertTriangle size={12} />
-              已逾期
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3 mb-3 sm:mb-2">
+          <h4 className="font-bold text-slate-900 truncate text-base sm:text-lg flex-1 sm:flex-none">{project.name}</h4>
+          <div className="flex flex-wrap gap-2">
+            <span className={cn(
+              "status-pill",
+              project.group === '绘本组' ? "bg-blue-100 text-blue-700" :
+              project.group === '科普组' ? "bg-purple-100 text-purple-700" :
+              project.group === '文学组' ? "bg-emerald-100 text-emerald-700" :
+              "bg-slate-100 text-slate-700"
+            )}>
+              {project.group}
             </span>
-          )}
-          {isCompleted && (
-            <span className="status-pill bg-emerald-100 text-emerald-700 flex items-center gap-1">
-              <CheckCircle2 size={12} />
-              已完成
-            </span>
-          )}
+            {isOverdue && (
+              <span className="status-pill bg-rose-100 text-rose-700 flex items-center gap-1">
+                <AlertTriangle size={12} />
+                已逾期
+              </span>
+            )}
+            {isCompleted && (
+              <span className="status-pill bg-emerald-100 text-emerald-700 flex items-center gap-1">
+                <CheckCircle2 size={12} />
+                已完成
+              </span>
+            )}
+          </div>
         </div>
         
-        <div className="flex items-center gap-6 text-sm text-slate-500">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-6 text-xs sm:text-sm text-slate-500">
           <div className="flex items-center gap-1.5">
-            <Users size={16} />
-            <span>{projectEditors.map(e => e.name).join(', ') || '未分配'}</span>
+            <Users size={14} className="sm:size-4" />
+            <span className="truncate">{projectEditors.map(e => e.name).join(', ') || '未分配'}</span>
           </div>
           <div className="flex items-center gap-1.5">
-            <Calendar size={16} />
+            <Calendar size={14} className="sm:size-4" />
             <span>计划入库: {storageStage?.plannedDate}</span>
           </div>
           <div className="flex items-center gap-1.5">
-            <Clock size={16} />
+            <Clock size={14} className="sm:size-4" />
             <span>当前环节: <span className="text-indigo-600 font-medium">{currentStageName}</span></span>
           </div>
         </div>
       </div>
 
-      <div className="w-48">
+      <div className="w-full sm:w-48 mt-2 sm:mt-0">
         <div className="flex items-center justify-between mb-2">
-          <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">完成进度</span>
-          <span className="text-sm font-bold text-indigo-600">{progress}%</span>
+          <span className="text-[10px] sm:text-xs font-bold text-slate-500 uppercase tracking-wider">完成进度</span>
+          <span className="text-xs sm:text-sm font-bold text-indigo-600">{progress}%</span>
         </div>
-        <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+        <div className="h-1.5 sm:h-2 bg-slate-100 rounded-full overflow-hidden">
           <div 
             className={cn("h-full rounded-full transition-all duration-500", isCompleted ? "bg-emerald-500" : "bg-indigo-600")}
             style={{ width: `${progress}%` }}
@@ -1077,20 +1212,20 @@ function ProjectCard({ project, editors, onClick, onDelete, onEdit }: {
         </div>
       </div>
 
-      <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+      <div className="flex items-center gap-2 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity absolute top-4 right-4 sm:static">
         <button 
           onClick={(e) => { e.stopPropagation(); onEdit(); }}
-          className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
+          className="p-1.5 sm:p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
         >
-          <Edit2 size={18} />
+          <Edit2 size={16} className="sm:size-[18px]" />
         </button>
         <button 
           onClick={(e) => { e.stopPropagation(); onDelete(); }}
-          className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
+          className="p-1.5 sm:p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
         >
-          <Trash2 size={18} />
+          <Trash2 size={16} className="sm:size-[18px]" />
         </button>
-        <ChevronRight className="text-slate-300" size={20} />
+        <ChevronRight className="text-slate-300 hidden sm:block" size={20} />
       </div>
     </div>
   );
@@ -1127,27 +1262,29 @@ function ProjectDetailView({ project, editors, onBack, onUpdate, onDelete, onEdi
         返回列表
       </button>
 
-      <div className="flex items-start justify-between">
-        <div>
-          <div className="flex items-center gap-3 mb-2">
-            <h2 className="text-3xl font-bold text-slate-900">{project.name}</h2>
-            <span className="status-pill bg-indigo-100 text-indigo-700 text-sm px-3 py-1">{project.group}</span>
-            <button 
-              onClick={onEdit}
-              className="flex items-center gap-1.5 px-3 py-1 bg-white border border-slate-200 rounded-lg text-xs font-semibold text-slate-600 hover:text-indigo-600 hover:border-indigo-200 hover:bg-indigo-50 transition-all shadow-sm"
-            >
-              <Edit2 size={12} />
-              项目信息
-            </button>
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-6">
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-3 mb-3">
+            <h2 className="text-2xl sm:text-3xl font-bold text-slate-900 truncate">{project.name}</h2>
+            <div className="flex items-center gap-2">
+              <span className="status-pill bg-indigo-100 text-indigo-700 text-xs sm:text-sm px-2 sm:px-3 py-1">{project.group}</span>
+              <button 
+                onClick={onEdit}
+                className="flex items-center gap-1.5 px-2 sm:px-3 py-1 bg-white border border-slate-200 rounded-lg text-[10px] sm:text-xs font-semibold text-slate-600 hover:text-indigo-600 hover:border-indigo-200 hover:bg-indigo-50 transition-all shadow-sm"
+              >
+                <Edit2 size={10} className="sm:size-3" />
+                项目信息
+              </button>
+            </div>
           </div>
-          <p className="text-slate-500 flex items-center gap-2">
-            <Users size={18} />
+          <p className="text-sm sm:text-base text-slate-500 flex items-center gap-2">
+            <Users size={16} className="sm:size-[18px]" />
             责任编辑: {editors.filter(e => project.editorIds.includes(e.id)).map(e => e.name).join(', ') || '未分配'}
           </p>
         </div>
-        <div className="text-right">
-          <div className="text-sm font-bold text-slate-400 uppercase tracking-wider mb-1">总体进度</div>
-          <div className="text-4xl font-black text-indigo-600">{progress}%</div>
+        <div className="flex sm:flex-col items-center sm:items-end justify-between sm:justify-start bg-indigo-50 sm:bg-transparent p-4 sm:p-0 rounded-2xl sm:rounded-none">
+          <div className="text-[10px] sm:text-sm font-bold text-slate-400 uppercase tracking-wider mb-0 sm:mb-1">总体进度</div>
+          <div className="text-3xl sm:text-4xl font-black text-indigo-600">{progress}%</div>
         </div>
       </div>
 
@@ -1217,10 +1354,10 @@ function ProjectDetailView({ project, editors, onBack, onUpdate, onDelete, onEdi
         })}
       </div>
 
-      <div className="flex justify-end gap-4 pt-8 border-t border-slate-200">
+      <div className="flex flex-col sm:flex-row justify-end gap-3 sm:gap-4 pt-8 border-t border-slate-200">
         <button 
           onClick={onDelete}
-          className="px-6 py-2.5 rounded-xl border border-rose-200 text-rose-600 font-bold hover:bg-rose-50 transition-all"
+          className="w-full sm:w-auto px-6 py-2.5 rounded-xl border border-rose-200 text-rose-600 font-bold hover:bg-rose-50 transition-all text-sm sm:text-base"
         >
           删除项目
         </button>
@@ -1249,128 +1386,132 @@ function EditorManagerView({ editors, projects, onAdd, onUpdate, onDelete }: {
 
   return (
     <div className="max-w-3xl mx-auto space-y-8">
-      <div className="glass-card p-6">
-        <h3 className="font-bold text-slate-800 mb-4">新增编辑人员</h3>
-        <div className="flex gap-3">
+      <div className="glass-card p-4 sm:p-6">
+        <h3 className="font-bold text-slate-800 mb-4 text-sm sm:text-base">新增编辑人员</h3>
+        <div className="flex flex-col sm:flex-row gap-3">
           <input 
             type="text" 
             placeholder="输入编辑姓名..." 
-            className="flex-1 px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+            className="flex-1 px-4 py-2 sm:py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-sm"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
           />
-          <select 
-            className="px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-            value={newGroup}
-            onChange={(e) => setNewGroup(e.target.value as Group)}
-          >
-            {GROUPS.map(g => <option key={g} value={g}>{g}</option>)}
-          </select>
-          <button 
-            onClick={() => { if (newName) { onAdd(newName, newGroup); setNewName(''); } }}
-            className="bg-indigo-600 text-white px-6 py-2.5 rounded-xl font-bold hover:bg-indigo-700 transition-all"
-          >
-            添加
-          </button>
+          <div className="flex gap-2">
+            <select 
+              className="flex-1 sm:flex-none px-4 py-2 sm:py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-sm"
+              value={newGroup}
+              onChange={(e) => setNewGroup(e.target.value as Group)}
+            >
+              {GROUPS.map(g => <option key={g} value={g}>{g}</option>)}
+            </select>
+            <button 
+              onClick={() => { if (newName) { onAdd(newName, newGroup); setNewName(''); } }}
+              className="flex-1 sm:flex-none bg-indigo-600 text-white px-6 py-2 sm:py-2.5 rounded-xl font-bold hover:bg-indigo-700 transition-all text-sm"
+            >
+              添加
+            </button>
+          </div>
         </div>
       </div>
 
       <div className="glass-card overflow-hidden">
-        <table className="w-full text-left">
-          <thead className="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider">
-            <tr>
-              <th className="px-6 py-4 font-semibold">编辑姓名</th>
-              <th className="px-6 py-4 font-semibold">所属组别</th>
-              <th className="px-6 py-4 font-semibold">负责项目数</th>
-              <th className="px-6 py-4 font-semibold text-right">操作</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-100">
-            {editors.map(editor => (
-              <tr key={editor.id} className="hover:bg-slate-50 transition-colors">
-                <td className="px-6 py-4">
-                  {editingId === editor.id ? (
-                    <input 
-                      autoFocus
-                      className="px-2 py-1 border border-indigo-300 rounded focus:outline-none w-full"
-                      value={editValue}
-                      onChange={(e) => setEditValue(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === 'Enter') handleSave(editor.id); if (e.key === 'Escape') setEditingId(null); }}
-                    />
-                  ) : (
-                    <span className="font-medium text-slate-900">{editor.name}</span>
-                  )}
-                </td>
-                <td className="px-6 py-4">
-                  {editingId === editor.id ? (
-                    <select 
-                      className="px-2 py-1 border border-indigo-300 rounded focus:outline-none text-sm w-full"
-                      value={editGroup}
-                      onChange={(e) => setEditGroup(e.target.value as Group)}
-                    >
-                      {GROUPS.map(g => <option key={g} value={g}>{g}</option>)}
-                    </select>
-                  ) : (
-                    <span className={cn(
-                      "status-pill",
-                      editor.group === '绘本组' ? "bg-blue-100 text-blue-700" :
-                      editor.group === '科普组' ? "bg-purple-100 text-purple-700" :
-                      editor.group === '文学组' ? "bg-emerald-100 text-emerald-700" :
-                      "bg-slate-100 text-slate-700"
-                    )}>
-                      {editor.group}
-                    </span>
-                  )}
-                </td>
-                <td className="px-6 py-4 text-slate-500">
-                  {projects.filter(p => p.editorIds.includes(editor.id)).length} 个项目
-                </td>
-                <td className="px-6 py-4 text-right">
-                  <div className="flex items-center justify-end gap-2">
-                    {editingId === editor.id ? (
-                      <>
-                        <button 
-                          onClick={() => handleSave(editor.id)}
-                          className="p-1 text-emerald-600 hover:bg-emerald-50 rounded transition-colors"
-                          title="保存"
-                        >
-                          <CheckCircle2 size={18} />
-                        </button>
-                        <button 
-                          onClick={() => setEditingId(null)}
-                          className="p-1 text-slate-400 hover:bg-slate-100 rounded transition-colors"
-                          title="取消"
-                        >
-                          <X size={18} />
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <button 
-                          onClick={() => { setEditingId(editor.id); setEditValue(editor.name); setEditGroup(editor.group); }}
-                          className="p-2 text-slate-400 hover:text-indigo-600 transition-colors"
-                          title="编辑"
-                        >
-                          <Edit2 size={16} />
-                        </button>
-                        <button 
-                          onClick={() => {
-                            console.log('Delete button clicked for editor:', editor.id);
-                            onDelete(editor.id);
-                          }}
-                          className="p-2 text-slate-400 hover:text-rose-600 transition-colors cursor-pointer"
-                          title="删除"
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </td>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left min-w-[500px]">
+            <thead className="bg-slate-50 text-slate-500 text-[10px] sm:text-xs uppercase tracking-wider">
+              <tr>
+                <th className="px-4 sm:px-6 py-3 sm:py-4 font-semibold">编辑姓名</th>
+                <th className="px-4 sm:px-6 py-3 sm:py-4 font-semibold">所属组别</th>
+                <th className="px-4 sm:px-6 py-3 sm:py-4 font-semibold">负责项目数</th>
+                <th className="px-4 sm:px-6 py-3 sm:py-4 font-semibold text-right">操作</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {editors.map(editor => (
+                <tr key={editor.id} className="hover:bg-slate-50 transition-colors">
+                  <td className="px-4 sm:px-6 py-3 sm:py-4">
+                    {editingId === editor.id ? (
+                      <input 
+                        autoFocus
+                        className="px-2 py-1 border border-indigo-300 rounded focus:outline-none w-full text-sm"
+                        value={editValue}
+                        onChange={(e) => setEditValue(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') handleSave(editor.id); if (e.key === 'Escape') setEditingId(null); }}
+                      />
+                    ) : (
+                      <span className="font-medium text-slate-900 text-sm">{editor.name}</span>
+                    )}
+                  </td>
+                  <td className="px-4 sm:px-6 py-3 sm:py-4">
+                    {editingId === editor.id ? (
+                      <select 
+                        className="px-2 py-1 border border-indigo-300 rounded focus:outline-none text-xs sm:text-sm w-full"
+                        value={editGroup}
+                        onChange={(e) => setEditGroup(e.target.value as Group)}
+                      >
+                        {GROUPS.map(g => <option key={g} value={g}>{g}</option>)}
+                      </select>
+                    ) : (
+                      <span className={cn(
+                        "status-pill text-[10px] sm:text-xs",
+                        editor.group === '绘本组' ? "bg-blue-100 text-blue-700" :
+                        editor.group === '科普组' ? "bg-purple-100 text-purple-700" :
+                        editor.group === '文学组' ? "bg-emerald-100 text-emerald-700" :
+                        "bg-slate-100 text-slate-700"
+                      )}>
+                        {editor.group}
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-4 sm:px-6 py-3 sm:py-4 text-slate-500 text-xs sm:text-sm">
+                    {projects.filter(p => p.editorIds.includes(editor.id)).length} 个项目
+                  </td>
+                  <td className="px-4 sm:px-6 py-3 sm:py-4 text-right">
+                    <div className="flex items-center justify-end gap-1 sm:gap-2">
+                      {editingId === editor.id ? (
+                        <>
+                          <button 
+                            onClick={() => handleSave(editor.id)}
+                            className="p-1 text-emerald-600 hover:bg-emerald-50 rounded transition-colors"
+                            title="保存"
+                          >
+                            <CheckCircle2 size={18} />
+                          </button>
+                          <button 
+                            onClick={() => setEditingId(null)}
+                            className="p-1 text-slate-400 hover:bg-slate-100 rounded transition-colors"
+                            title="取消"
+                          >
+                            <X size={18} />
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button 
+                            onClick={() => { setEditingId(editor.id); setEditValue(editor.name); setEditGroup(editor.group); }}
+                            className="p-1.5 sm:p-2 text-slate-400 hover:text-indigo-600 transition-colors"
+                            title="编辑"
+                          >
+                            <Edit2 size={14} className="sm:size-4" />
+                          </button>
+                          <button 
+                            onClick={() => {
+                              console.log('Delete button clicked for editor:', editor.id);
+                              onDelete(editor.id);
+                            }}
+                            className="p-1.5 sm:p-2 text-slate-400 hover:text-rose-600 transition-colors cursor-pointer"
+                            title="删除"
+                          >
+                            <Trash2 size={14} className="sm:size-4" />
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
@@ -1458,11 +1599,11 @@ function ProjectModal({ isOpen, onClose, onSave, editors, onAddEditor, initialDa
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6">
             <div className="space-y-2">
               <label className="text-sm font-bold text-slate-700">所属组别</label>
               <select 
-                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-sm"
                 value={formData.group}
                 onChange={(e) => setFormData({ ...formData, group: e.target.value as any })}
               >
@@ -1473,7 +1614,7 @@ function ProjectModal({ isOpen, onClose, onSave, editors, onAddEditor, initialDa
               <div className="space-y-2">
                 <label className="text-sm font-bold text-slate-700">当前环节 (自动完成之前环节)</label>
                 <select 
-                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 text-sm"
                   value={currentStageIndex}
                   onChange={(e) => handleCurrentStageChange(parseInt(e.target.value))}
                 >
@@ -1498,7 +1639,7 @@ function ProjectModal({ isOpen, onClose, onSave, editors, onAddEditor, initialDa
           <div className="space-y-2">
             <label className="text-sm font-bold text-slate-700">责任编辑 (可多选)</label>
             <div className="flex flex-col gap-2 mb-3">
-              <div className="flex gap-2">
+              <div className="flex flex-col sm:flex-row gap-2">
                 <input 
                   type="text" 
                   placeholder="新增编辑姓名..." 
@@ -1506,25 +1647,27 @@ function ProjectModal({ isOpen, onClose, onSave, editors, onAddEditor, initialDa
                   value={newEditorName}
                   onChange={(e) => setNewEditorName(e.target.value)}
                 />
-                <select 
-                  className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-                  value={newEditorGroup}
-                  onChange={(e) => setNewEditorGroup(e.target.value as Group)}
-                >
-                  {GROUPS.map(g => <option key={g} value={g}>{g}</option>)}
-                </select>
-                <button 
-                  type="button"
-                  onClick={() => {
-                    if (newEditorName) {
-                      onAddEditor(newEditorName, newEditorGroup);
-                      setNewEditorName('');
-                    }
-                  }}
-                  className="px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-sm font-bold hover:bg-slate-200 transition-all"
-                >
-                  添加
-                </button>
+                <div className="flex gap-2">
+                  <select 
+                    className="flex-1 sm:flex-none px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                    value={newEditorGroup}
+                    onChange={(e) => setNewEditorGroup(e.target.value as Group)}
+                  >
+                    {GROUPS.map(g => <option key={g} value={g}>{g}</option>)}
+                  </select>
+                  <button 
+                    type="button"
+                    onClick={() => {
+                      if (newEditorName) {
+                        onAddEditor(newEditorName, newEditorGroup);
+                        setNewEditorName('');
+                      }
+                    }}
+                    className="flex-1 sm:flex-none px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-sm font-bold hover:bg-slate-200 transition-all"
+                  >
+                    添加
+                  </button>
+                </div>
               </div>
             </div>
             <div className="flex flex-wrap gap-2 p-3 bg-slate-50 border border-slate-200 rounded-xl min-h-[50px]">
@@ -1534,7 +1677,7 @@ function ProjectModal({ isOpen, onClose, onSave, editors, onAddEditor, initialDa
                   type="button"
                   onClick={() => handleToggleEditor(editor.id)}
                   className={cn(
-                    "px-3 py-1.5 rounded-lg text-sm font-medium transition-all",
+                    "px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-all",
                     formData.editorIds?.includes(editor.id) 
                       ? "bg-indigo-600 text-white shadow-sm" 
                       : "bg-white text-slate-600 border border-slate-200 hover:border-indigo-300"
@@ -1557,16 +1700,16 @@ function ProjectModal({ isOpen, onClose, onSave, editors, onAddEditor, initialDa
           </div>
         </div>
 
-        <div className="p-6 border-t border-slate-100 bg-slate-50 flex justify-end gap-4">
+        <div className="p-4 sm:p-6 border-t border-slate-100 bg-slate-50 flex flex-col sm:flex-row justify-end gap-3 sm:gap-4">
           <button 
             onClick={onClose}
-            className="px-6 py-2.5 rounded-xl font-bold text-slate-500 hover:bg-slate-200 transition-all"
+            className="w-full sm:w-auto px-6 py-2.5 rounded-xl font-bold text-slate-500 hover:bg-slate-200 transition-all text-sm sm:text-base"
           >
             取消
           </button>
           <button 
             onClick={() => onSave(formData)}
-            className="px-8 py-2.5 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-200"
+            className="w-full sm:w-auto px-8 py-2.5 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-200 text-sm sm:text-base"
           >
             保存项目
           </button>
